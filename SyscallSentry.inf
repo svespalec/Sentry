@@ -1,0 +1,62 @@
+;
+; SyscallSentry.inf
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System ; TODO: specify appropriate Class
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318} ; TODO: specify appropriate ClassGuid
+Provider    = %ManufacturerName%
+CatalogFile = SyscallSentry.cat
+DriverVer   = ; TODO: set DriverVer in stampinf property pages
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+SyscallSentry.sys = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%SyscallSentry.DeviceDesc% = SyscallSentry_Device, Root\SyscallSentry ; TODO: edit hw-id
+
+[SyscallSentry_Device.NT]
+CopyFiles = File_Copy
+
+[File_Copy]
+SyscallSentry.sys
+
+;-------------- Service installation
+[SyscallSentry_Device.NT.Services]
+AddService = SyscallSentry,%SPSVCINST_ASSOCSERVICE%, SyscallSentry_Service_Inst
+
+; -------------- SyscallSentry driver install sections
+[SyscallSentry_Service_Inst]
+DisplayName    = %SyscallSentry.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\SyscallSentry.sys
+
+[SyscallSentry_Device.NT.Wdf]
+KmdfService = SyscallSentry, SyscallSentry_wdfsect
+
+[SyscallSentry_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "<Your manufacturer name>" ;TODO: Replace with your manufacturer name
+DiskName = "SyscallSentry Installation Disk"
+SyscallSentry.DeviceDesc = "SyscallSentry Device"
+SyscallSentry.SVCDESC = "SyscallSentry Service"

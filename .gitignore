@@ -1,0 +1,14 @@
+.vs
+.vscode
+build
+CMakeFiles
+output/
+CMakeCache.txt
+CMakeLists.txt.bak
+.idea
+cmake-build-*
+Debug
+x86
+x64
+vcpkg_installed
+Release/

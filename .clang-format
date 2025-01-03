@@ -1,0 +1,10 @@
+BasedOnStyle: Google
+PointerAlignment: Left
+InsertNewlineAtEOF: True
+DerivePointerAlignment: false
+ColumnLimit: 100
+Cpp11BracedListStyle: false
+AlignConsecutiveAssignments: true
+SortIncludes: false
+FixNamespaceComments: true
+ShortNamespaceLines: 0
