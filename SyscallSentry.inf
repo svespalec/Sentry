@@ -60,3 +60,6 @@ ManufacturerName = "<Your manufacturer name>" ;TODO: Replace with your manufactu
 DiskName = "SyscallSentry Installation Disk"
 SyscallSentry.DeviceDesc = "SyscallSentry Device"
 SyscallSentry.SVCDESC = "SyscallSentry Service"
+
+[SyscallSentry_Device.AddRegistry]
+HKR,,"ThreadNotifyAccess",0x00010001,1

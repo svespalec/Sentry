@@ -20,7 +20,7 @@ PVOID GetThreadStartAddress(PETHREAD Thread) {
     return NULL;
 
   // Query thread start address
-  Status = NtQueryInformationThread(
+  Status = ZwQueryInformationThread(
     ThreadHandle, 
     ThreadQuerySetWin32StartAddress, 
     &StartAddress,                                
@@ -210,10 +210,23 @@ NTSTATUS RegisterCallbacks() {
 }
 // clang-format on
 
-NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
   UNREFERENCED_PARAMETER(DriverObject);
+
+  // Remove thread creation notification callback
+  PsRemoveCreateThreadNotifyRoutine(ThreadCreateCallback);
+
+  // Remove image load notification callback
+  PsRemoveLoadImageNotifyRoutine(ImageLoadCallback);
+
+  DbgPrint("[Sentry]: Driver unloaded, all callbacks removed\n");
+}
+
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
   UNREFERENCED_PARAMETER(RegistryPath);
 
+  DriverObject->DriverUnload = DriverUnload;
   DbgPrint("[Sentry]: Loaded driver!\n");
 
   return RegisterCallbacks();
