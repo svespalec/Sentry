@@ -14,3 +14,38 @@ EXTERN_C NTSTATUS NTAPI NtQueryInformationThread(
   IN ULONG ThreadInformationLength,                                                
   OUT PULONG ReturnLength OPTIONAL);
 // clang-format on
+
+// Global structure to store ntdll information
+typedef struct _MONITOR_CONTEXT {
+  PVOID NtdllBase;
+  SIZE_T NtdllSize;
+} MONITOR_CONTEXT, *PMONITOR_CONTEXT;
+
+MONITOR_CONTEXT g_MonitorContext = { 0 };
+
+typedef struct _SYSCALL_PATTERN {
+  UCHAR Pattern[2];
+  SIZE_T Size;
+} SYSCALL_PATTERN, *PSYSCALL_PATTERN;
+
+// Known syscall instruction patterns
+const SYSCALL_PATTERN SyscallPatterns[] = {
+  { { 0x0F, 0x05 }, 2 },  // syscall
+  { { 0xCD, 0x2E }, 2 }   // int 2Eh
+};
+
+BOOLEAN ContainsSyscallInstruction(PVOID Buffer, SIZE_T Size) {
+  PUCHAR ByteBuffer = (PUCHAR)Buffer;
+
+  // Scan through the buffer looking for syscall patterns
+  for (SIZE_T i = 0; i < Size - 1; i++) {
+    for (SIZE_T j = 0; j < ARRAYSIZE(SyscallPatterns); j++) {
+      if (RtlCompareMemory(&ByteBuffer[i], SyscallPatterns[j].Pattern, SyscallPatterns[j].Size) ==
+          SyscallPatterns[j].Size) {
+        return TRUE;
+      }
+    }
+  }
+
+  return FALSE;
+}
