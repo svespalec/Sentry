@@ -213,15 +213,11 @@ NTSTATUS RegisterCallbacks() {
 VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
   UNREFERENCED_PARAMETER(DriverObject);
 
-  // Remove thread creation notification callback
   PsRemoveCreateThreadNotifyRoutine(ThreadCreateCallback);
-
-  // Remove image load notification callback
   PsRemoveLoadImageNotifyRoutine(ImageLoadCallback);
 
   DbgPrint("[Sentry]: Driver unloaded, all callbacks removed\n");
 }
-
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
   UNREFERENCED_PARAMETER(RegistryPath);
