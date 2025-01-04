@@ -123,8 +123,6 @@ NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
 }
 
 VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
-  UNREFERENCED_PARAMETER(ProcessId);
-
   // If this isn't a thread being created, skip
   if (!Create) 
     return;
