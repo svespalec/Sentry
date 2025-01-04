@@ -123,6 +123,9 @@
   <ItemGroup>
     <ClCompile Include="Source\DriverEntry.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Source\Includes.hpp" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
