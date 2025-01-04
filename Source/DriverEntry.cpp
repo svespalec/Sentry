@@ -167,6 +167,16 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
     return;
   }
 
+  // Get process name
+  PCCH ProcessName = GetProcessNameFromProcess(Process);
+
+  DbgPrint("[Sentry]: Analyzing thread 0x%p in process %s (PID: %d) at address 0x%p\n",
+    ThreadId,
+    ProcessName,
+    HandleToULong(ProcessId),
+    StartAddress
+  );
+
   Status = IsMaliciousThread(StartAddress, Process);
   DbgPrint("[Sentry]: Thread analysis result: %x\n", Status);
 

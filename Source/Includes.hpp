@@ -12,7 +12,13 @@ EXTERN_C NTSTATUS NTAPI NtQueryInformationThread(
   IN THREADINFOCLASS ThreadInformationClass,                                               
   OUT PVOID ThreadInformation,                                                
   IN ULONG ThreadInformationLength,                                                
-  OUT PULONG ReturnLength OPTIONAL);
+  OUT PULONG ReturnLength OPTIONAL
+);
+
+EXTERN_C NTKERNELAPI PCHAR NTAPI PsGetProcessImageFileName(
+  _In_ PEPROCESS Process
+);
+
 // clang-format on
 
 // Global structure to store ntdll information
@@ -48,4 +54,8 @@ BOOLEAN ContainsSyscallInstruction(PVOID Buffer, SIZE_T Size) {
   }
 
   return FALSE;
+}
+
+PCCH GetProcessNameFromProcess(PEPROCESS Process) {
+  return (PCCH)PsGetProcessImageFileName(Process);
 }
