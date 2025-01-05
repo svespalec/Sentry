@@ -1,4 +1,4 @@
-# Sentry - Direct Syscall Detection Driver
+# Sentry
 
 A kernel driver that detects and blocks direct syscall attacks through thread monitoring.
 
