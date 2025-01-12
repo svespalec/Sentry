@@ -1,6 +1,23 @@
 #include "Includes.hpp"
 
 // clang-format off
+
+// Image load notification callback
+VOID ImageLoadCallback(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo) {
+  UNREFERENCED_PARAMETER(ProcessId);
+
+  // Check if the loaded image is ntdll.dll
+  if (FullImageName && FullImageName->Buffer && wcsstr(FullImageName->Buffer, L"\\ntdll.dll")) {
+    g_MonitorContext.NtdllBase = ImageInfo->ImageBase;
+    g_MonitorContext.NtdllSize = ImageInfo->ImageSize;
+
+    DbgPrint("[Sentry]: ntdll.dll loaded at 0x%p with size 0x%zx\n", 
+      g_MonitorContext.NtdllBase,          
+      g_MonitorContext.NtdllSize
+    );
+  }
+}
+
 PVOID GetThreadStartAddress(PETHREAD Thread) {
   HANDLE ThreadHandle = NULL;
   PVOID StartAddress  = NULL;
@@ -8,13 +25,12 @@ PVOID GetThreadStartAddress(PETHREAD Thread) {
   // Get thread handle
   NTSTATUS Status = ObOpenObjectByPointer(
     Thread, 
-    OBJ_KERNEL_HANDLE, 
-    NULL, 
-    THREAD_QUERY_INFORMATION,                                        
+    OBJ_KERNEL_HANDLE,
+    NULL,
+    THREAD_QUERY_INFORMATION,                                       
     *PsThreadType, 
     KernelMode, 
-    &ThreadHandle
-  );
+    &ThreadHandle);
 
   if (!NT_SUCCESS(Status)) 
     return NULL;
@@ -25,8 +41,7 @@ PVOID GetThreadStartAddress(PETHREAD Thread) {
     ThreadQuerySetWin32StartAddress, 
     &StartAddress,                                
     sizeof(PVOID), 
-    NULL
-  );
+    NULL);
 
   ZwClose(ThreadHandle);
 
@@ -36,34 +51,32 @@ PVOID GetThreadStartAddress(PETHREAD Thread) {
   return StartAddress;
 }
 
-// Callback for image load notifications
-VOID ImageLoadCallback(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo) {
-  UNREFERENCED_PARAMETER(ProcessId);
-
-  // Check if the loaded image is ntdll.dll
-  if (wcsstr(FullImageName->Buffer, L"\\ntdll.dll")) {
-    g_MonitorContext.NtdllBase = ImageInfo->ImageBase;
-    g_MonitorContext.NtdllSize = ImageInfo->ImageSize;
-
-    DbgPrint("[Sentry]: ntdll.dll loaded at 0x%p with size 0x%zx\n", 
-      g_MonitorContext.NtdllBase,
-      g_MonitorContext.NtdllSize
-    );
-  }
-}
-
-// Simple check if an address is within NTDLL
+// Simple check if an address is within ntdll.dll (usermode)
 BOOLEAN IsAddressInNtdll(PVOID Address) {
-  if (!g_MonitorContext.NtdllBase || !g_MonitorContext.NtdllSize) 
+  if (!g_MonitorContext.NtdllBase || !g_MonitorContext.NtdllSize) {
+    DbgPrint("[Sentry]: Warning - NtdllBase/Size not initialized\n");
     return FALSE;
+  }
 
-  return ((ULONG_PTR)Address >= (ULONG_PTR)g_MonitorContext.NtdllBase &&
-          (ULONG_PTR)Address < (ULONG_PTR)g_MonitorContext.NtdllBase + g_MonitorContext.NtdllSize);
+  DbgPrint("[Sentry]: Checking address 0x%p against ntdll range: 0x%p - 0x%p\n", 
+    Address,
+    g_MonitorContext.NtdllBase,
+    (ULONG_PTR)g_MonitorContext.NtdllBase + g_MonitorContext.NtdllSize
+  );
+
+  return (
+    (ULONG_PTR)Address >= (ULONG_PTR)g_MonitorContext.NtdllBase && 
+    (ULONG_PTR)Address < (ULONG_PTR)g_MonitorContext.NtdllBase + g_MonitorContext.NtdllSize
+  );
 }
 
 NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
   // Verifies IRQL is PASSIVE_LEVEL
   PAGED_CODE();
+
+  // Skip system process
+  if (PsGetProcessId(Process) <= (HANDLE)4) 
+    return STATUS_SUCCESS;
 
   KAPC_STATE ApcState = { 0 };
   SIZE_T RegionSize   = 0;
@@ -73,11 +86,11 @@ NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
   KeStackAttachProcess(Process, &ApcState);
 
   NTSTATUS Status = ZwQueryVirtualMemory(
-    ZwCurrentProcess(),
-    StartAddress,
-    MemoryBasicInformation,                                      
-    &MemInfo,
-    sizeof(MemInfo), 
+    ZwCurrentProcess(), 
+    StartAddress, 
+    MemoryBasicInformation,                                       
+    &MemInfo, 
+    sizeof(MemInfo),
     NULL
   );
 
@@ -87,19 +100,16 @@ NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
     KeUnstackDetachProcess(&ApcState);
 
     DbgPrint("[Sentry]: IOC => Cannot query memory region at 0x%p, Status: 0x%X\n", 
-      StartAddress, 
+      StartAddress,
       Status
     );
 
-    return STATUS_ACCESS_DENIED; // Block the thread
-   }
+    // Block the thread
+    return STATUS_ACCESS_DENIED; 
+  }
 
   // Allocate buffer for entire region
-  PVOID buffer = ExAllocatePool2(
-    POOL_FLAG_PAGED, 
-    MemInfo.RegionSize, 
-    'scan'
-  );
+  PVOID buffer = ExAllocatePool2(POOL_FLAG_PAGED, MemInfo.RegionSize, 'scan');
 
   if (!buffer) {
     KeUnstackDetachProcess(&ApcState);
@@ -112,20 +122,31 @@ NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
   ProbeForRead(StartAddress, MemInfo.RegionSize, sizeof(UCHAR));
   RtlCopyMemory(buffer, StartAddress, MemInfo.RegionSize);
 
-  // Do checks on buffer here before freeing
-  //
-  //
+  if (ContainsSyscallInstruction(buffer, MemInfo.RegionSize)) {
+    DbgPrint("[Sentry]: IOC => Detected syscall pattern in thread at 0x%p\n", StartAddress);
+
+    // Block the thread
+    Status = STATUS_ACCESS_DENIED;  
+  } else {
+    Status = STATUS_SUCCESS;
+  }
 
   ExFreePoolWithTag(buffer, 'scan');
   KeUnstackDetachProcess(&ApcState);
 
-  return STATUS_SUCCESS;
+  return Status;
 }
 
 VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
   // If this isn't a thread being created, skip
   if (!Create) 
     return;
+
+  // Skip if NTDLL info is not yet available
+  if (!g_MonitorContext.NtdllBase || !g_MonitorContext.NtdllSize) {
+    DbgPrint("[Sentry]: Skipping thread check - NTDLL info not yet available\n");
+    return;
+  }
 
   PEPROCESS Process = NULL;
   PETHREAD Thread   = NULL;
@@ -145,13 +166,12 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
 
   PVOID StartAddress = GetThreadStartAddress(Thread);
 
- if (!StartAddress) {
-    DbgPrint("[Sentry]: IOC => Thread 0x%p has invalid/hidden start address."
-      "Terminating thread\n", 
-      ThreadId
+  if (!StartAddress) {
+    DbgPrint(
+      "[Sentry]: IOC => Thread 0x%p has invalid/hidden start address." 
+      "Terminating thread\n",
+       ThreadId
     );
-
-    // TerminateThread(Thread);
 
     ObDereferenceObject(Thread);
     ObDereferenceObject(Process);
@@ -170,12 +190,13 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
 
   DbgPrint("[Sentry]: Analyzing thread 0x%p in process %s (PID: %d) at address 0x%p\n",
     ThreadId,
-    ProcessName,
-    HandleToULong(ProcessId),
+    ProcessName, 
+    HandleToULong(ProcessId), 
     StartAddress
   );
 
   Status = IsMaliciousThread(StartAddress, Process);
+
   DbgPrint("[Sentry]: Thread analysis result: %x\n", Status);
 
   ObDereferenceObject(Thread);
@@ -186,37 +207,35 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
 }
 
 NTSTATUS RegisterCallbacks() {
-  NTSTATUS Status = PsSetLoadImageNotifyRoutine(ImageLoadCallback);
+  NTSTATUS status;
 
-  if (!NT_SUCCESS(Status)) {
-    DbgPrint("[Sentry]: ImageLoadCallback failure: 0x%X\n", Status);
-    return Status;
+  // Register image load callback
+  status = PsSetLoadImageNotifyRoutine(ImageLoadCallback);
+
+  if (!NT_SUCCESS(status)) {
+    DbgPrint("[Sentry]: Failed to register image load callback (0x%08X)\n", status);
+    return status;
   }
 
-  // PsSetCreateThreadNotifyRoutineEx executes in suspended new thread context before
-  // initialization, allowing for thread analysis and termination.
-  Status = PsSetCreateThreadNotifyRoutineEx(
-    PsCreateThreadNotifyNonSystem, 
-    ThreadCreateCallback
-  );
+  // Register thread creation callback
+  status = PsSetCreateThreadNotifyRoutine(ThreadCreateCallback);
 
-  if (!NT_SUCCESS(Status)) {
-    DbgPrint("[Sentry]: ThreadCreateCallback failure: 0x%X\n", Status);
+  if (!NT_SUCCESS(status)) {
     PsRemoveLoadImageNotifyRoutine(ImageLoadCallback);
-    return Status;
+    DbgPrint("[Sentry]: Failed to register thread callback (0x%08X)\n", status);
+    return status;
   }
 
   return STATUS_SUCCESS;
 }
-// clang-format on
 
 VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
   UNREFERENCED_PARAMETER(DriverObject);
 
-  PsRemoveCreateThreadNotifyRoutine(ThreadCreateCallback);
   PsRemoveLoadImageNotifyRoutine(ImageLoadCallback);
+  PsRemoveCreateThreadNotifyRoutine(ThreadCreateCallback);
 
-  DbgPrint("[Sentry]: Driver unloaded, all callbacks removed\n");
+  DbgPrint("[Sentry]: Driver unloaded\n");
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
@@ -227,3 +246,4 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
   return RegisterCallbacks();
 }
+// clang-format on
