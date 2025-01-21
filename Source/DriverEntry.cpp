@@ -4,6 +4,8 @@
 
 // Global variable definitions
 MONITOR_CONTEXT g_MonitorContext = { 0 };
+KSPIN_LOCK g_OutputLock;
+KIRQL g_OldIrql;
 
 // Known syscall instruction patterns
 const SYSCALL_PATTERN SyscallPatterns[] = {
@@ -11,35 +13,50 @@ const SYSCALL_PATTERN SyscallPatterns[] = {
     { { 0xCD, 0x2E }, 2 }   // int 2Eh
 };
 
+// Helper function to synchronize output
+VOID SynchronizedPrint(PCCH Format, ...) {
+    va_list Args;
+    va_start(Args, Format);
+    
+    // Acquire spinlock
+    KeAcquireSpinLock(&g_OutputLock, &g_OldIrql);
+    
+    // Print the message
+    vDbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, Format, Args);
+    
+    // Small delay to ensure output is flushed
+    KeStallExecutionProcessor(100);
+    
+    // Release spinlock
+    KeReleaseSpinLock(&g_OutputLock, g_OldIrql);
+    
+    va_end(Args);
+}
+
 // Helper function implementations
 VOID DumpMemoryAround(PUCHAR Buffer, SIZE_T Offset, SIZE_T Size) {
-    const SIZE_T CONTEXT_BYTES = 16;  // Bytes to show before/after
+    const SIZE_T CONTEXT_BYTES = 16;
     SIZE_T StartOffset = (Offset > CONTEXT_BYTES) ? Offset - CONTEXT_BYTES : 0;
     SIZE_T EndOffset = min(Offset + CONTEXT_BYTES, Size);
     
-    // Single buffer for the hex dump
     CHAR OutputBuffer[256] = { 0 };
     SIZE_T CurrentPos = 0;
     
-    // Write the header
     RtlStringCbPrintfA(OutputBuffer, sizeof(OutputBuffer), 
-        "    [Memory Analysis]\n"
-        "    - Syscall found at offset: 0x%zx\n"
-        "    - Memory dump: ", Offset);
+        "| Memory Analysis:                                                                |\n"
+        "| - Syscall found at offset: 0x%zx                                               |\n"
+        "| - Memory dump: ", Offset);
     
-    // Get the initial position after header
     RtlStringCbLengthA(OutputBuffer, sizeof(OutputBuffer), &CurrentPos);
     
-    // Add hex dump
     for (SIZE_T i = StartOffset; i < EndOffset; i++) {
         RtlStringCbPrintfA(&OutputBuffer[CurrentPos], sizeof(OutputBuffer) - CurrentPos, 
             "%02X ", Buffer[i]);
         RtlStringCbLengthA(OutputBuffer, sizeof(OutputBuffer), &CurrentPos);
     }
     
-    // Add marker line
     RtlStringCbPrintfA(&OutputBuffer[CurrentPos], sizeof(OutputBuffer) - CurrentPos, 
-        "\n    - Syscall at:  ");  // Added extra space for alignment
+        "\n| - Syscall at:  ");
     RtlStringCbLengthA(OutputBuffer, sizeof(OutputBuffer), &CurrentPos);
     
     for (SIZE_T i = StartOffset; i < EndOffset; i++) {
@@ -48,8 +65,7 @@ VOID DumpMemoryAround(PUCHAR Buffer, SIZE_T Offset, SIZE_T Size) {
         RtlStringCbLengthA(OutputBuffer, sizeof(OutputBuffer), &CurrentPos);
     }
     
-    // Single print
-    DbgPrint("%s\n", OutputBuffer);
+    SynchronizedPrint("%s|\n", OutputBuffer);
 }
 
 
@@ -147,9 +163,9 @@ BOOLEAN ParsePECertificate(PUNICODE_STRING FilePath) {
                             // Certificate data exists and was read successfully
                             hasValidCert = TRUE;
                             
-                            DbgPrint("  - Certificate Details:\n");
-                            DbgPrint("    * Size: %lu bytes\n", securityDir.Size);
-                            DbgPrint("    * Location: 0x%08X\n", securityDir.VirtualAddress);
+                            SynchronizedPrint("  - Certificate Details:\n");
+                            SynchronizedPrint("    * Size: %lu bytes\n", securityDir.Size);
+                            SynchronizedPrint("    * Location: 0x%08X\n", securityDir.VirtualAddress);
                         }
                         
                         ExFreePoolWithTag(certData, 'treC');
@@ -175,7 +191,7 @@ VOID ImageLoadCallback(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_I
     g_MonitorContext.NtdllBase = ImageInfo->ImageBase;
     g_MonitorContext.NtdllSize = ImageInfo->ImageSize;
 
-    DbgPrint("[Sentry]: ntdll.dll loaded at 0x%p with size 0x%zx\n", 
+    SynchronizedPrint("[Sentry]: ntdll.dll loaded at 0x%p with size 0x%zx\n", 
       g_MonitorContext.NtdllBase,          
       g_MonitorContext.NtdllSize
     );
@@ -218,7 +234,7 @@ PVOID GetThreadStartAddress(PETHREAD Thread) {
 // Simple check if an address is within ntdll.dll (usermode)
 BOOLEAN IsAddressInNtdll(PVOID Address) {
   if (!g_MonitorContext.NtdllBase || !g_MonitorContext.NtdllSize) {
-    DbgPrint("[Sentry] Warning: NtdllBase/Size not initialized\n");
+    SynchronizedPrint("[Sentry] Warning: NtdllBase/Size not initialized\n");
     return FALSE;
   }
 
@@ -252,7 +268,7 @@ BOOLEAN IsAddressInProcessMemory(PVOID Address, PEPROCESS Process) {
              (MemInfo.Type == MEM_IMAGE || MemInfo.Type == MEM_MAPPED));
     
     if (Result) {
-      DbgPrint("[Sentry]: Address 0x%p is within valid process memory region [0x%p - 0x%p]\n",
+      SynchronizedPrint("[Sentry]: Address 0x%p is within valid process memory region [0x%p - 0x%p]\n",
         Address,
         MemInfo.BaseAddress,
         (PVOID)((ULONG_PTR)MemInfo.BaseAddress + MemInfo.RegionSize)
@@ -265,105 +281,109 @@ BOOLEAN IsAddressInProcessMemory(PVOID Address, PEPROCESS Process) {
 }
 
 NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
-  // Verifies IRQL is PASSIVE_LEVEL
-  PAGED_CODE();
+    // Verifies IRQL is PASSIVE_LEVEL
+    PAGED_CODE();
 
-  // Skip system process
-  if (PsGetProcessId(Process) <= (HANDLE)4) 
-    return STATUS_SUCCESS;
+    // Skip system process
+    if (PsGetProcessId(Process) <= (HANDLE)4) 
+        return STATUS_SUCCESS;
 
-  KAPC_STATE ApcState = { 0 };
-  MEMORY_BASIC_INFORMATION MemInfo{};
+    KAPC_STATE ApcState = { 0 };
+    MEMORY_BASIC_INFORMATION MemInfo{};
 
-  // Attach to process context
-  KeStackAttachProcess(Process, &ApcState);
+    // Attach to process context
+    KeStackAttachProcess(Process, &ApcState);
 
-  NTSTATUS Status = ZwQueryVirtualMemory(
-    ZwCurrentProcess(), 
-    StartAddress, 
-    MemoryBasicInformation,                                       
-    &MemInfo, 
-    sizeof(MemInfo),
-    NULL
-  );
-
-  // Can't query region, which is highly suspicious
-  if (!NT_SUCCESS(Status)) {
-    KeUnstackDetachProcess(&ApcState);
-    DbgPrint("[Sentry]: IOC => Cannot query memory region at 0x%p, Status: 0x%X\n", 
-      StartAddress,
-      Status
+    NTSTATUS Status = ZwQueryVirtualMemory(
+        ZwCurrentProcess(), 
+        StartAddress, 
+        MemoryBasicInformation,                                       
+        &MemInfo, 
+        sizeof(MemInfo),
+        NULL
     );
-    return STATUS_ACCESS_DENIED;
-  }
 
-  // Allocate buffer for entire region
-  PVOID buffer = ExAllocatePool2(POOL_FLAG_PAGED, MemInfo.RegionSize, 'scan');
-
-  if (!buffer) {
-    KeUnstackDetachProcess(&ApcState);
-    return STATUS_INSUFFICIENT_RESOURCES;
-  }
-
-  // Safely copy the thread contents for analysis
-  RtlZeroMemory(buffer, MemInfo.RegionSize);
-  ProbeForRead(StartAddress, MemInfo.RegionSize, sizeof(UCHAR));
-  RtlCopyMemory(buffer, StartAddress, MemInfo.RegionSize);
-
-  BOOLEAN HasSyscall = ContainsSyscallInstruction(buffer, MemInfo.RegionSize);
-  
-  ExFreePoolWithTag(buffer, 'scan');
-  KeUnstackDetachProcess(&ApcState);
-
-  if (HasSyscall) {
-    DbgPrint("[Sentry]: Direct syscall detected at 0x%p\n", StartAddress);
-
-    // If it's in ntdll, allow it
-    if (IsAddressInNtdll(StartAddress)) {
-      DbgPrint("[Sentry]: Allowing syscall from ntdll\n");
-      return STATUS_SUCCESS;
-    }
-
-    // Get process image path for certificate check
-    PUNICODE_STRING ProcessImagePath = NULL;
-    NTSTATUS PathStatus = SeLocateProcessImageName(Process, &ProcessImagePath);
-    
-    // Check if process is signed and address is in valid memory
-    BOOLEAN IsSigned = FALSE;
-    if (NT_SUCCESS(PathStatus) && ProcessImagePath != NULL) {
-      IsSigned = ParsePECertificate(ProcessImagePath);
-      ExFreePool(ProcessImagePath);
-    }
-    
-    BOOLEAN IsValidMemory = IsAddressInProcessMemory(StartAddress, Process);
-
-    DbgPrint("    [Security Analysis]\n"
-            "    - Start Address: 0x%p\n"
-            "    - Memory Region: [0x%p - 0x%p]\n"
-            "    - Memory Type: %s\n"
-            "    - Signature: %s\n"
-            "    - Status: %s\n\n",
+    // Can't query region, which is highly suspicious
+    if (!NT_SUCCESS(Status)) {
+        KeUnstackDetachProcess(&ApcState);
+        SynchronizedPrint("\n[Sentry]: IOC => Cannot query memory region at 0x%p, Status: 0x%X\n\n", 
             StartAddress,
-            g_MonitorContext.NtdllBase,
-            (PVOID)((ULONG_PTR)g_MonitorContext.NtdllBase + g_MonitorContext.NtdllSize),
-            IsValidMemory ? "Valid" : "Suspicious",
-            IsSigned ? "Valid" : "Invalid/Missing",
-            (IsSigned && IsValidMemory) ? "Allowed" : "Blocked");
-
-    if (IsSigned && IsValidMemory) {
-      DbgPrint("[Sentry]: Allowing direct syscall from signed process in valid memory region\n");
-      return STATUS_SUCCESS;
+            Status
+        );
+        return STATUS_ACCESS_DENIED;
     }
 
-    DbgPrint("[Sentry]: IOC => Blocking direct syscall from %s process in %s memory region\n",
-      IsSigned ? "signed" : "unsigned",
-      IsValidMemory ? "valid" : "suspicious"
-    );
-    
-    return STATUS_ACCESS_DENIED;
-  }
+    // Allocate buffer for entire region
+    PVOID buffer = ExAllocatePool2(POOL_FLAG_PAGED, MemInfo.RegionSize, 'scan');
 
-  return STATUS_SUCCESS;
+    if (!buffer) {
+        KeUnstackDetachProcess(&ApcState);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Safely copy the thread contents for analysis
+    RtlZeroMemory(buffer, MemInfo.RegionSize);
+    ProbeForRead(StartAddress, MemInfo.RegionSize, sizeof(UCHAR));
+    RtlCopyMemory(buffer, StartAddress, MemInfo.RegionSize);
+
+    BOOLEAN HasSyscall = ContainsSyscallInstruction(buffer, MemInfo.RegionSize);
+    
+    ExFreePoolWithTag(buffer, 'scan');
+    KeUnstackDetachProcess(&ApcState);
+
+    if (HasSyscall) {
+        PCCH ProcessName = GetProcessNameFromProcess(Process);
+        
+        SynchronizedPrint("\n[Sentry] Direct Syscall Detection\n");
+        SynchronizedPrint("-------------------------------------------------------------------------------\n");
+        SynchronizedPrint("| Process: %-63s |\n", ProcessName);
+        SynchronizedPrint("-------------------------------------------------------------------------------\n");
+        
+        // If it's in ntdll, allow it
+        if (IsAddressInNtdll(StartAddress)) {
+            SynchronizedPrint("| Location: NTDLL (Allowed)                                                    |\n");
+            SynchronizedPrint("| Address:  0x%-60p |\n", StartAddress);
+            SynchronizedPrint("-------------------------------------------------------------------------------\n\n");
+            return STATUS_SUCCESS;
+        }
+
+        // Get process image path for certificate check
+        PUNICODE_STRING ProcessImagePath = NULL;
+        NTSTATUS PathStatus = SeLocateProcessImageName(Process, &ProcessImagePath);
+        
+        // Check if process is signed and address is in valid memory
+        BOOLEAN IsSigned = FALSE;
+        if (NT_SUCCESS(PathStatus) && ProcessImagePath != NULL) {
+            IsSigned = ParsePECertificate(ProcessImagePath);
+            ExFreePool(ProcessImagePath);
+        }
+        
+        BOOLEAN IsValidMemory = IsAddressInProcessMemory(StartAddress, Process);
+
+        SynchronizedPrint("| Security Analysis:                                                           |\n");
+        SynchronizedPrint("| - Start Address: 0x%-56p |\n", StartAddress);
+        SynchronizedPrint("| - Memory Region: [0x%p - 0x%p]            |\n", 
+            g_MonitorContext.NtdllBase,
+            (PVOID)((ULONG_PTR)g_MonitorContext.NtdllBase + g_MonitorContext.NtdllSize));
+        SynchronizedPrint("| - Memory Type:   %-56s |\n", IsValidMemory ? "Valid" : "Suspicious");
+        SynchronizedPrint("| - Signature:     %-56s |\n", IsSigned ? "Valid" : "Invalid/Missing");
+        SynchronizedPrint("| - Status:        %-56s |\n", (IsSigned && IsValidMemory) ? "Allowed" : "Blocked");
+
+        if (IsSigned && IsValidMemory) {
+            SynchronizedPrint("-------------------------------------------------------------------------------\n\n");
+            return STATUS_SUCCESS;
+        }
+
+        SynchronizedPrint("| Alert:                                                                       |\n");
+        SynchronizedPrint("| [!] Blocking direct syscall - %s process in %s memory region      |\n",
+            IsSigned ? "Signed" : "Unsigned",
+            IsValidMemory ? "valid" : "suspicious");
+        SynchronizedPrint("-------------------------------------------------------------------------------\n\n");
+        
+        return STATUS_ACCESS_DENIED;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
@@ -371,7 +391,7 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
         return;
 
     if (!g_MonitorContext.NtdllBase || !g_MonitorContext.NtdllSize) {
-        DbgPrint("[Sentry] Warning: NTDLL info not yet available - skipping thread check\n\n");
+        SynchronizedPrint("⚠️ [Sentry] Warning: NTDLL info not yet available - skipping thread check\n\n");
         return;
     }
 
@@ -391,33 +411,20 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
 
     PVOID StartAddress = GetThreadStartAddress(Thread);
     if (!StartAddress) {
-        DbgPrint("[Sentry] Thread Analysis:\n"
-                "    - Thread ID: 0x%p\n"
-                "    - Status: Invalid/Hidden start address\n"
-                "    - Action: Thread blocked\n\n",
-                ThreadId);
+        PCCH ProcessName = GetProcessNameFromProcess(Process);
+        SynchronizedPrint("\n[Sentry] Hidden Thread Detection\n");
+        SynchronizedPrint("-------------------------------------------------------------------------------\n");
+        SynchronizedPrint("| Process:    %-60s |\n", ProcessName);
+        SynchronizedPrint("| Thread ID:  0x%-58p |\n", ThreadId);
+        SynchronizedPrint("| Status:     Hidden/Invalid start address                                     |\n");
+        SynchronizedPrint("| Action:     Thread blocked                                                   |\n");
+        SynchronizedPrint("-------------------------------------------------------------------------------\n\n");
         ObDereferenceObject(Thread);
         ObDereferenceObject(Process);
         return;
     }
 
-    PCCH ProcessName = GetProcessNameFromProcess(Process);
-
-    DbgPrint("[Sentry] Thread Analysis:\n"
-            "    - Process: %s (PID: %d)\n"
-            "    - Thread ID: 0x%p\n"
-            "    - Start Address: 0x%p\n"
-            "    - NTDLL Range: [0x%p - 0x%p]\n"
-            "    - In NTDLL: %s\n\n",
-            ProcessName, 
-            HandleToULong(ProcessId), 
-            ThreadId,
-            StartAddress,
-            g_MonitorContext.NtdllBase,
-            (PVOID)((ULONG_PTR)g_MonitorContext.NtdllBase + g_MonitorContext.NtdllSize),
-            IsAddressInNtdll(StartAddress) ? "Yes" : "No");
-
-    // If thread is within ntdll, skip analysis
+    // Skip analysis if thread is within ntdll
     if (IsAddressInNtdll(StartAddress)) {
         ObDereferenceObject(Process);
         ObDereferenceObject(Thread);
@@ -425,14 +432,6 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
     }
 
     Status = IsMaliciousThread(StartAddress, Process);
-
-    // Only print result if something interesting was found
-    if (Status != STATUS_SUCCESS) {
-        DbgPrint("    [Result] Suspicious Activity:\n"
-                "    - Status Code: 0x%08X\n"
-                "    - Action: Thread blocked\n\n", 
-                Status);
-    }
 
     ObDereferenceObject(Thread);
     ObDereferenceObject(Process);
@@ -464,15 +463,13 @@ VOID ProcessCreateCallback(
 
             BOOLEAN hasCert = ParsePECertificate(imagePath);
             
-            DbgPrint("[Sentry] New Process:\n"
-                    "    - Name: %wZ\n"
-                    "    - PID: %llu\n"
-                    "    - Path: %wZ\n"
-                    "    - Signature: %s\n\n",
-                    &processName,
-                    (ULONGLONG)ProcessId,
-                    imagePath,
-                    hasCert ? "Valid" : "Invalid/Missing");
+            SynchronizedPrint("\n[Sentry] New Process Created\n");
+            SynchronizedPrint("-------------------------------------------------------------------------------\n");
+            SynchronizedPrint("| Name: %-63wZ |\n", &processName);
+            SynchronizedPrint("| PID:  %-63llu |\n", (ULONGLONG)ProcessId);
+            SynchronizedPrint("| Path: %-63wZ |\n", imagePath);
+            SynchronizedPrint("| Cert: %-63s |\n", hasCert ? "Valid" : "Invalid/Missing");
+            SynchronizedPrint("-------------------------------------------------------------------------------\n\n");
 
             ExFreePool(imagePath);
         }
@@ -486,7 +483,7 @@ NTSTATUS RegisterCallbacks() {
   status = PsSetLoadImageNotifyRoutine(ImageLoadCallback);
 
   if (!NT_SUCCESS(status)) {
-    DbgPrint("[Sentry]: Failed to register image load callback (0x%08X)\n", status);
+    SynchronizedPrint("[Sentry]: Failed to register image load callback (0x%08X)\n", status);
     return status;
   }
 
@@ -495,7 +492,7 @@ NTSTATUS RegisterCallbacks() {
 
   if (!NT_SUCCESS(status)) {
     PsRemoveLoadImageNotifyRoutine(ImageLoadCallback);
-    DbgPrint("[Sentry]: Failed to register thread callback (0x%08X)\n", status);
+    SynchronizedPrint("[Sentry]: Failed to register thread callback (0x%08X)\n", status);
     return status;
   }
 
@@ -520,14 +517,17 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
         TRUE    // TRUE for removal
     );
 
-  DbgPrint("[Sentry]: Driver unloaded\n");
+  SynchronizedPrint("[Sentry]: Driver unloaded\n");
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
   UNREFERENCED_PARAMETER(RegistryPath);
 
+  // Initialize the spinlock
+  KeInitializeSpinLock(&g_OutputLock);
+
   DriverObject->DriverUnload = DriverUnload;
-  DbgPrint("[Sentry]: Loaded driver!\n");
+  SynchronizedPrint("[Sentry]: Loaded driver!\n\n");
 
   return RegisterCallbacks();
 }
