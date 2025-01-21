@@ -3,116 +3,204 @@
 #include <ntdef.h>
 #include <ntifs.h>
 #include <wdm.h>
+#include <fltKernel.h>
+#include <wdmsec.h>
+#include <ntstrsafe.h>
 
-typedef struct _RTL_PROCESS_MODULE_INFORMATION {
-  HANDLE Section;
-  PVOID MappedBase;
-  PVOID ImageBase;
-  ULONG ImageSize;
-  ULONG Flags;
-  USHORT LoadOrderIndex;
-  USHORT InitOrderIndex;
-  USHORT LoadCount;
-  USHORT OffsetToFileName;
-  UCHAR FullPathName[256];
-} RTL_PROCESS_MODULE_INFORMATION, *PRTL_PROCESS_MODULE_INFORMATION;
+// Memory type definitions from WinNT.h
+#ifndef MEM_MAPPED
+#define MEM_MAPPED  0x40000
+#endif
 
-typedef struct _RTL_PROCESS_MODULES {
-  ULONG NumberOfModules;
-  RTL_PROCESS_MODULE_INFORMATION Modules[1];
-} RTL_PROCESS_MODULES, *PRTL_PROCESS_MODULES;
+#ifndef MEM_IMAGE  
+#define MEM_IMAGE   0x1000000
+#endif
 
-typedef enum _SYSTEM_INFORMATION_CLASS {
-  SystemBasicInformation  = 0,
-  SystemModuleInformation = 11
-} SYSTEM_INFORMATION_CLASS;
+// Process/Thread access rights from WinNT.h
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION (0x0400)
+#endif
 
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ          (0x0010)
+#endif
+
+#ifndef THREAD_QUERY_INFORMATION
 #define THREAD_QUERY_INFORMATION (0x0040)
+#endif
 
-// clang-format off
-EXTERN_C NTSTATUS NTAPI NtQueryInformationThread(
-  IN HANDLE ThreadHandle,                                               
-  IN THREADINFOCLASS ThreadInformationClass,                                               
-  OUT PVOID ThreadInformation,                                                
-  IN ULONG ThreadInformationLength,                                                
-  OUT PULONG ReturnLength OPTIONAL
+// Windows base types if not defined
+typedef unsigned long DWORD;
+typedef void* LPVOID;
+typedef const char* PCSTR;
+typedef const wchar_t* PCWSTR;
+typedef unsigned short WORD;
+typedef unsigned char BYTE;
+
+// Signature verification definitions
+typedef struct _FILE_SIGNATURE_INFO {
+    ULONG Flags;
+    ULONG CertificateState;
+    ULONG HashState;
+    ULONG SignatureState;
+    LARGE_INTEGER ValidFrom;
+    LARGE_INTEGER ValidUntil;
+} FILE_SIGNATURE_INFO, *PFILE_SIGNATURE_INFO;
+
+// Function declarations
+EXTERN_C_START
+
+// Process/Thread functions
+NTKERNELAPI PCHAR PsGetProcessImageFileName(
+    _In_ PEPROCESS Process
 );
 
-EXTERN_C NTKERNELAPI PCHAR NTAPI PsGetProcessImageFileName(
-  _In_ PEPROCESS Process
+// Thread information functions
+NTSYSAPI NTSTATUS NTAPI ZwQueryInformationThread(
+    _In_ HANDLE ThreadHandle,
+    _In_ THREADINFOCLASS ThreadInformationClass,
+    _Out_writes_bytes_(ThreadInformationLength) PVOID ThreadInformation,
+    _In_ ULONG ThreadInformationLength,
+    _Out_opt_ PULONG ReturnLength
 );
 
-EXTERN_C NTSTATUS ZwQueryInformationThread(
- _In_ HANDLE ThreadHandle,
- _In_ THREADINFOCLASS ThreadInformationClass,
- _Out_writes_bytes_(ThreadInformationLength) PVOID ThreadInformation,
- _In_ ULONG ThreadInformationLength,
- _Out_opt_ PULONG ReturnLength
-);
-
-EXTERN_C NTSTATUS NTAPI ZwQuerySystemInformation(
-  _In_ SYSTEM_INFORMATION_CLASS SystemInformationClass,
-  _Out_writes_bytes_opt_(SystemInformationLength) PVOID SystemInformation,
-  _In_ ULONG SystemInformationLength,
-  _Out_opt_ PULONG ReturnLength
-);
-
-EXTERN_C NTKERNELAPI PPEB NTAPI PsGetProcessPeb(IN PEPROCESS Process);
-// clang-format on
+EXTERN_C_END
 
 // Global structure to store ntdll information
 typedef struct _MONITOR_CONTEXT {
-  PVOID NtdllBase;
-  SIZE_T NtdllSize;
+    PVOID NtdllBase;
+    SIZE_T NtdllSize;
 } MONITOR_CONTEXT, *PMONITOR_CONTEXT;
 
-MONITOR_CONTEXT g_MonitorContext = { 0 };
+extern MONITOR_CONTEXT g_MonitorContext;
 
 typedef struct _SYSCALL_PATTERN {
-  UCHAR Pattern[2];
-  SIZE_T Size;
+    UCHAR Pattern[2];
+    SIZE_T Size;
 } SYSCALL_PATTERN, *PSYSCALL_PATTERN;
 
 // Known syscall instruction patterns
-const SYSCALL_PATTERN SyscallPatterns[] = {
-  { { 0x0F, 0x05 }, 2 },  // syscall
-  { { 0xCD, 0x2E }, 2 }   // int 2Eh
-};
-// Helper to dump bytes around pattern
-VOID DumpMemoryAround(PUCHAR Buffer, SIZE_T Offset, SIZE_T Size) {
-  const SIZE_T CONTEXT_BYTES = 16;  // Bytes to show before/after
-  SIZE_T StartOffset         = (Offset > CONTEXT_BYTES) ? Offset - CONTEXT_BYTES : 0;
-  SIZE_T EndOffset           = min(Offset + CONTEXT_BYTES, Size);
+extern const SYSCALL_PATTERN SyscallPatterns[];
 
-  DbgPrint("[Sentry]: Memory dump around offset 0x%zx:\n", Offset);
-  for (SIZE_T i = StartOffset; i < EndOffset; i++) {
-    DbgPrint("%02X ", Buffer[i]);
-    if ((i - StartOffset + 1) % 16 == 0) DbgPrint("\n");
-  }
-  DbgPrint("\n");
-}
+// Function declarations
+VOID DumpMemoryAround(
+    _In_reads_bytes_(Size) PUCHAR Buffer,
+    _In_ SIZE_T Offset,
+    _In_ SIZE_T Size
+);
 
-BOOLEAN ContainsSyscallInstruction(PVOID Buffer, SIZE_T Size) {
-  if (!Buffer || Size < 2) return FALSE;
+BOOLEAN ContainsSyscallInstruction(
+    _In_reads_bytes_(Size) PVOID Buffer,
+    _In_ SIZE_T Size
+);
 
-  PUCHAR ByteBuffer = (PUCHAR)Buffer;
+PCCH GetProcessNameFromProcess(
+    _In_ PEPROCESS Process
+);
 
-  // Scan through the buffer looking for syscall patterns
-  for (SIZE_T i = 0; i <= Size - 2; i++) {
-    for (SIZE_T j = 0; j < ARRAYSIZE(SyscallPatterns); j++) {
-      if (i + SyscallPatterns[j].Size <= Size) {
-        if (RtlCompareMemory(&ByteBuffer[i], SyscallPatterns[j].Pattern, SyscallPatterns[j].Size) ==
-            SyscallPatterns[j].Size) {
-          // Dump memory context around the pattern
-          DumpMemoryAround(ByteBuffer, i, Size);
-          return TRUE;
-        }
-      }
-    }
-  }
-  return FALSE;
-}
+BOOLEAN IsProcessSigned(
+    _In_ PEPROCESS Process
+);
 
-PCCH GetProcessNameFromProcess(PEPROCESS Process) {
-  return (PCCH)PsGetProcessImageFileName(Process);
-}
+BOOLEAN IsAddressInProcessMemory(
+    _In_ PVOID Address,
+    _In_ PEPROCESS Process
+);
+
+#define IMAGE_DOS_SIGNATURE 0x5A4D     // MZ
+#define IMAGE_NT_SIGNATURE 0x00004550  // PE00
+#define IMAGE_DIRECTORY_ENTRY_SECURITY 4
+
+typedef struct _IMAGE_DOS_HEADER {
+  WORD e_magic;     // Magic number (should be IMAGE_DOS_SIGNATURE)
+  WORD e_cblp;      // Bytes on last page of file
+  WORD e_cp;        // Pages in file
+  WORD e_crlc;      // Relocations
+  WORD e_cparhdr;   // Size of header in paragraphs
+  WORD e_minalloc;  // Minimum extra paragraphs needed
+  WORD e_maxalloc;  // Maximum extra paragraphs needed
+  WORD e_ss;        // Initial (relative) SS value
+  WORD e_sp;        // Initial SP value
+  WORD e_csum;      // Checksum
+  WORD e_ip;        // Initial IP value
+  WORD e_cs;        // Initial (relative) CS value
+  WORD e_lfarlc;    // File address of relocation table
+  WORD e_ovno;      // Overlay number
+  WORD e_res[4];    // Reserved words
+  WORD e_oemid;     // OEM identifier
+  WORD e_oeminfo;   // OEM information
+  WORD e_res2[10];  // Reserved words
+  LONG e_lfanew;    // File address of new exe header
+} IMAGE_DOS_HEADER, *PIMAGE_DOS_HEADER;
+
+typedef struct _IMAGE_FILE_HEADER {
+  WORD Machine;
+  WORD NumberOfSections;
+  DWORD TimeDateStamp;
+  DWORD PointerToSymbolTable;
+  DWORD NumberOfSymbols;
+  WORD SizeOfOptionalHeader;
+  WORD Characteristics;
+} IMAGE_FILE_HEADER, *PIMAGE_FILE_HEADER;
+
+typedef struct _IMAGE_DATA_DIRECTORY {
+  DWORD VirtualAddress;
+  DWORD Size;
+} IMAGE_DATA_DIRECTORY, *PIMAGE_DATA_DIRECTORY;
+
+typedef struct _IMAGE_OPTIONAL_HEADER64 {
+  WORD Magic;
+  BYTE MajorLinkerVersion;
+  BYTE MinorLinkerVersion;
+  DWORD SizeOfCode;
+  DWORD SizeOfInitializedData;
+  DWORD SizeOfUninitializedData;
+  DWORD AddressOfEntryPoint;
+  DWORD BaseOfCode;
+  ULONGLONG ImageBase;
+  DWORD SectionAlignment;
+  DWORD FileAlignment;
+  WORD MajorOperatingSystemVersion;
+  WORD MinorOperatingSystemVersion;
+  WORD MajorImageVersion;
+  WORD MinorImageVersion;
+  WORD MajorSubsystemVersion;
+  WORD MinorSubsystemVersion;
+  DWORD Win32VersionValue;
+  DWORD SizeOfImage;
+  DWORD SizeOfHeaders;
+  DWORD CheckSum;
+  WORD Subsystem;
+  WORD DllCharacteristics;
+  ULONGLONG SizeOfStackReserve;
+  ULONGLONG SizeOfStackCommit;
+  ULONGLONG SizeOfHeapReserve;
+  ULONGLONG SizeOfHeapCommit;
+  DWORD LoaderFlags;
+  DWORD NumberOfRvaAndSizes;
+  IMAGE_DATA_DIRECTORY DataDirectory[16];
+} IMAGE_OPTIONAL_HEADER64, *PIMAGE_OPTIONAL_HEADER64;
+
+typedef struct _IMAGE_NT_HEADERS64 {
+  DWORD Signature;
+  IMAGE_FILE_HEADER FileHeader;
+  IMAGE_OPTIONAL_HEADER64 OptionalHeader;
+} IMAGE_NT_HEADERS64, *PIMAGE_NT_HEADERS64;
+
+// Add RtlStringCb function declarations if not defined
+#ifndef RtlStringCbPrintfA
+NTSTRSAFEDDI
+RtlStringCbPrintfA(
+    _Out_writes_bytes_(cbDest) NTSTRSAFE_PSTR pszDest,
+    _In_ size_t cbDest,
+    _In_ _Printf_format_string_ NTSTRSAFE_PCSTR pszFormat,
+    ...);
+#endif
+
+#ifndef RtlStringCbLengthA
+NTSTRSAFEDDI
+RtlStringCbLengthA(
+    _In_reads_or_z_(cbMax) NTSTRSAFE_PCSTR psz,
+    _In_ size_t cbMax,
+    _Out_opt_ size_t* pcbLength);
+#endif
