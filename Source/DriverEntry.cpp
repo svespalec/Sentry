@@ -35,59 +35,52 @@ VOID SynchronizedPrint(PCCH Format, ...) {
 
 // Helper function implementations
 VOID DumpMemoryAround(PUCHAR Buffer, SIZE_T Offset, SIZE_T Size) {
-    const SIZE_T CONTEXT_BYTES = 16;
+    const SIZE_T CONTEXT_BYTES = 8;
     SIZE_T StartOffset = (Offset > CONTEXT_BYTES) ? Offset - CONTEXT_BYTES : 0;
     SIZE_T EndOffset = min(Offset + CONTEXT_BYTES, Size);
-    
-    CHAR OutputBuffer[256] = { 0 };
+    CHAR HexDump[100] = {0};
+    CHAR PatternMarkers[100] = {0};
     SIZE_T CurrentPos = 0;
     
-    RtlStringCbPrintfA(OutputBuffer, sizeof(OutputBuffer), 
-        "| Memory Analysis:                                                                |\n"
-        "| - Syscall found at offset: 0x%zx                                               |\n"
-        "| - Memory dump: ", Offset);
-    
-    RtlStringCbLengthA(OutputBuffer, sizeof(OutputBuffer), &CurrentPos);
-    
+    // Build hex dump string
     for (SIZE_T i = StartOffset; i < EndOffset; i++) {
-        RtlStringCbPrintfA(&OutputBuffer[CurrentPos], sizeof(OutputBuffer) - CurrentPos, 
-            "%02X ", Buffer[i]);
-        RtlStringCbLengthA(OutputBuffer, sizeof(OutputBuffer), &CurrentPos);
-    }
-    
-    RtlStringCbPrintfA(&OutputBuffer[CurrentPos], sizeof(OutputBuffer) - CurrentPos, 
-        "\n| - Syscall at:  ");
-    RtlStringCbLengthA(OutputBuffer, sizeof(OutputBuffer), &CurrentPos);
-    
-    for (SIZE_T i = StartOffset; i < EndOffset; i++) {
-        RtlStringCbPrintfA(&OutputBuffer[CurrentPos], sizeof(OutputBuffer) - CurrentPos,
+        RtlStringCbPrintfA(&HexDump[CurrentPos], sizeof(HexDump) - CurrentPos, "%02X ", Buffer[i]);
+        RtlStringCbPrintfA(&PatternMarkers[CurrentPos], sizeof(PatternMarkers) - CurrentPos, 
             i == Offset ? "^^ " : "   ");
-        RtlStringCbLengthA(OutputBuffer, sizeof(OutputBuffer), &CurrentPos);
+        CurrentPos += 3;
     }
-    
-    SynchronizedPrint("%s|\n", OutputBuffer);
+
+    // Pad both strings to align with border
+    SIZE_T remaining = (16 - (EndOffset - StartOffset)) * 3;
+    RtlFillMemory(&HexDump[CurrentPos], remaining, ' ');
+    RtlFillMemory(&PatternMarkers[CurrentPos], remaining, ' ');
+    HexDump[CurrentPos + remaining] = '\0';
+    PatternMarkers[CurrentPos + remaining] = '\0';
+
+    SynchronizedPrint("| Memory Analysis                                                             |\n");
+    SynchronizedPrint("| - Syscall offset: 0x%-56zx |\n", Offset);
+    SynchronizedPrint("| - Memory dump:  %-57s |\n", HexDump);
+    SynchronizedPrint("| - Pattern at:   %-57s |\n", PatternMarkers);
 }
 
+BOOLEAN ContainsSyscallInstruction(PVOID Buffer, SIZE_T Size, SIZE_T* FoundOffset) {
+    if (!Buffer || Size < 2) return FALSE;
 
-BOOLEAN ContainsSyscallInstruction(PVOID Buffer, SIZE_T Size) {
-  if (!Buffer || Size < 2) return FALSE;
+    PUCHAR ByteBuffer = (PUCHAR)Buffer;
 
-  PUCHAR ByteBuffer = (PUCHAR)Buffer;
-
-  // Scan through the buffer looking for syscall patterns
-  for (SIZE_T i = 0; i <= Size - 2; i++) {
-    for (SIZE_T j = 0; j < ARRAYSIZE(SyscallPatterns); j++) {
-      if (i + SyscallPatterns[j].Size <= Size) {
-        if (RtlCompareMemory(&ByteBuffer[i], SyscallPatterns[j].Pattern, SyscallPatterns[j].Size) ==
-            SyscallPatterns[j].Size) {
-          // Dump memory context around the pattern
-          DumpMemoryAround(ByteBuffer, i, Size);
-          return TRUE;
+    // Scan through the buffer looking for syscall patterns
+    for (SIZE_T i = 0; i <= Size - 2; i++) {
+        for (SIZE_T j = 0; j < ARRAYSIZE(SyscallPatterns); j++) {
+            if (i + SyscallPatterns[j].Size <= Size) {
+                if (RtlCompareMemory(&ByteBuffer[i], SyscallPatterns[j].Pattern, SyscallPatterns[j].Size) ==
+                    SyscallPatterns[j].Size) {
+                    if (FoundOffset) *FoundOffset = i;
+                    return TRUE;
+                }
+            }
         }
-      }
     }
-  }
-  return FALSE;
+    return FALSE;
 }
 
 BOOLEAN ParsePECertificate(PUNICODE_STRING FilePath) {
@@ -246,38 +239,34 @@ BOOLEAN IsAddressInNtdll(PVOID Address) {
 }
 
 BOOLEAN IsAddressInProcessMemory(PVOID Address, PEPROCESS Process) {
-  KAPC_STATE ApcState = { 0 };
-  MEMORY_BASIC_INFORMATION MemInfo{};
-  BOOLEAN Result = FALSE;
+    KAPC_STATE ApcState = { 0 };
+    MEMORY_BASIC_INFORMATION MemInfo{};
+    BOOLEAN Result = FALSE;
 
-  // Attach to process context
-  KeStackAttachProcess(Process, &ApcState);
+    KeStackAttachProcess(Process, &ApcState);
 
-  NTSTATUS Status = ZwQueryVirtualMemory(
-    ZwCurrentProcess(),
-    Address,
-    MemoryBasicInformation,
-    &MemInfo,
-    sizeof(MemInfo),
-    NULL
-  );
-
-  if (NT_SUCCESS(Status)) {
-    // Check if memory is committed and belongs to the process
-    Result = (MemInfo.State == MEM_COMMIT && 
-             (MemInfo.Type == MEM_IMAGE || MemInfo.Type == MEM_MAPPED));
-    
-    if (Result) {
-      SynchronizedPrint("[Sentry]: Address 0x%p is within valid process memory region [0x%p - 0x%p]\n",
+    NTSTATUS Status = ZwQueryVirtualMemory(
+        ZwCurrentProcess(),
         Address,
-        MemInfo.BaseAddress,
-        (PVOID)((ULONG_PTR)MemInfo.BaseAddress + MemInfo.RegionSize)
-      );
-    }
-  }
+        MemoryBasicInformation,
+        &MemInfo,
+        sizeof(MemInfo),
+        NULL
+    );
 
-  KeUnstackDetachProcess(&ApcState);
-  return Result;
+    if (NT_SUCCESS(Status)) {
+        Result = (MemInfo.State == MEM_COMMIT && 
+                (MemInfo.Type == MEM_IMAGE || MemInfo.Type == MEM_MAPPED));
+        
+        // Format shorter memory range string
+        CHAR RangeStr[50];
+        RtlStringCbPrintfA(RangeStr, sizeof(RangeStr), 
+            "0x%p", Address);
+        SynchronizedPrint("| Valid memory address: %-54s |\n", RangeStr);
+    }
+
+    KeUnstackDetachProcess(&ApcState);
+    return Result;
 }
 
 NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
@@ -326,24 +315,28 @@ NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
     ProbeForRead(StartAddress, MemInfo.RegionSize, sizeof(UCHAR));
     RtlCopyMemory(buffer, StartAddress, MemInfo.RegionSize);
 
-    BOOLEAN HasSyscall = ContainsSyscallInstruction(buffer, MemInfo.RegionSize);
+    SIZE_T SyscallOffset = 0;
+    BOOLEAN HasSyscall = ContainsSyscallInstruction(buffer, MemInfo.RegionSize, &SyscallOffset);
     
-    ExFreePoolWithTag(buffer, 'scan');
-    KeUnstackDetachProcess(&ApcState);
-
     if (HasSyscall) {
         PCCH ProcessName = GetProcessNameFromProcess(Process);
         
-        SynchronizedPrint("\n[Sentry] Direct Syscall Detection\n");
         SynchronizedPrint("-------------------------------------------------------------------------------\n");
+        SynchronizedPrint("| Direct Syscall Detection                                                     |\n");
         SynchronizedPrint("| Process: %-63s |\n", ProcessName);
         SynchronizedPrint("-------------------------------------------------------------------------------\n");
         
         // If it's in ntdll, allow it
         if (IsAddressInNtdll(StartAddress)) {
-            SynchronizedPrint("| Location: NTDLL (Allowed)                                                    |\n");
-            SynchronizedPrint("| Address:  0x%-60p |\n", StartAddress);
+            SynchronizedPrint("| Security Analysis                                                            |\n");
+            SynchronizedPrint("| - Start Address: 0x%-56p |\n", StartAddress);
+            SynchronizedPrint("| - Memory Type:   NTDLL                                                      |\n");
+            SynchronizedPrint("| - Signature:     Valid                                                      |\n");
+            SynchronizedPrint("| - Status:        Allowed                                                    |\n");
+            DumpMemoryAround((PUCHAR)buffer, SyscallOffset, MemInfo.RegionSize);
             SynchronizedPrint("-------------------------------------------------------------------------------\n\n");
+            ExFreePoolWithTag(buffer, 'scan');
+            KeUnstackDetachProcess(&ApcState);
             return STATUS_SUCCESS;
         }
 
@@ -360,29 +353,32 @@ NTSTATUS IsMaliciousThread(PVOID StartAddress, PEPROCESS Process) {
         
         BOOLEAN IsValidMemory = IsAddressInProcessMemory(StartAddress, Process);
 
-        SynchronizedPrint("| Security Analysis:                                                           |\n");
+        SynchronizedPrint("| Security Analysis                                                            |\n");
         SynchronizedPrint("| - Start Address: 0x%-56p |\n", StartAddress);
-        SynchronizedPrint("| - Memory Region: [0x%p - 0x%p]            |\n", 
-            g_MonitorContext.NtdllBase,
-            (PVOID)((ULONG_PTR)g_MonitorContext.NtdllBase + g_MonitorContext.NtdllSize));
         SynchronizedPrint("| - Memory Type:   %-56s |\n", IsValidMemory ? "Valid" : "Suspicious");
         SynchronizedPrint("| - Signature:     %-56s |\n", IsSigned ? "Valid" : "Invalid/Missing");
         SynchronizedPrint("| - Status:        %-56s |\n", (IsSigned && IsValidMemory) ? "Allowed" : "Blocked");
+        DumpMemoryAround((PUCHAR)buffer, SyscallOffset, MemInfo.RegionSize);
 
         if (IsSigned && IsValidMemory) {
             SynchronizedPrint("-------------------------------------------------------------------------------\n\n");
+            ExFreePoolWithTag(buffer, 'scan');
+            KeUnstackDetachProcess(&ApcState);
             return STATUS_SUCCESS;
         }
 
-        SynchronizedPrint("| Alert:                                                                       |\n");
-        SynchronizedPrint("| [!] Blocking direct syscall - %s process in %s memory region      |\n",
-            IsSigned ? "Signed" : "Unsigned",
+        SynchronizedPrint("| Alert: Direct syscall detected in %s process with %s memory                  |\n",
+            IsSigned ? "signed" : "unsigned",
             IsValidMemory ? "valid" : "suspicious");
         SynchronizedPrint("-------------------------------------------------------------------------------\n\n");
         
+        ExFreePoolWithTag(buffer, 'scan');
+        KeUnstackDetachProcess(&ApcState);
         return STATUS_ACCESS_DENIED;
     }
 
+    ExFreePoolWithTag(buffer, 'scan');
+    KeUnstackDetachProcess(&ApcState);
     return STATUS_SUCCESS;
 }
 
@@ -412,7 +408,7 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
     PVOID StartAddress = GetThreadStartAddress(Thread);
     if (!StartAddress) {
         PCCH ProcessName = GetProcessNameFromProcess(Process);
-        SynchronizedPrint("\n[Sentry] Hidden Thread Detection\n");
+        SynchronizedPrint("\nHidden Thread Detection\n");
         SynchronizedPrint("-------------------------------------------------------------------------------\n");
         SynchronizedPrint("| Process:    %-60s |\n", ProcessName);
         SynchronizedPrint("| Thread ID:  0x%-58p |\n", ThreadId);
@@ -463,7 +459,7 @@ VOID ProcessCreateCallback(
 
             BOOLEAN hasCert = ParsePECertificate(imagePath);
             
-            SynchronizedPrint("\n[Sentry] New Process Created\n");
+            SynchronizedPrint("\nNew Process Created\n");
             SynchronizedPrint("-------------------------------------------------------------------------------\n");
             SynchronizedPrint("| Name: %-63wZ |\n", &processName);
             SynchronizedPrint("| PID:  %-63llu |\n", (ULONGLONG)ProcessId);
