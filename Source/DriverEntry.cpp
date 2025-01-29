@@ -387,7 +387,7 @@ VOID ThreadCreateCallback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
         return;
 
     if (!g_MonitorContext.NtdllBase || !g_MonitorContext.NtdllSize) {
-        SynchronizedPrint("⚠️ [Sentry] Warning: NTDLL info not yet available - skipping thread check\n\n");
+        SynchronizedPrint("[Sentry] Warning: NTDLL info not yet available - skipping thread check\n\n");
         return;
     }
 
